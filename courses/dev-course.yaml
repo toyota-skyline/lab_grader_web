@@ -1,0 +1,20 @@
+course:
+    name: Team Dev Course
+    semester: Осень 2026
+    university: ГУАП
+    timezone: UTC+3
+    github:
+        organization: toyota-skyline
+    google:
+        spreadsheet: 1fdYzNpuvU5AQInIYPUGipUXb_qUggywxRnxdcR3fuxc
+        info-sheet: График
+        task-id-column: 0
+        student-name-column: 1
+        lab-column-offset: 1
+labs:
+    "1":
+        github-prefix: lab1
+        short-name: ЛР1
+    "2":
+        github-prefix: lab2
+        short-name: ЛР2
