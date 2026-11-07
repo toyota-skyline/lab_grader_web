@@ -1,20 +1,49 @@
+---
+# Configuration file for lab-grader (Test Queue Course)
+
 course:
-    name: Team Dev Course
+    name: Test Queue Course
     semester: Осень 2026
-    university: ГУАП
+    university: Test
+    email: test@example.com
     timezone: UTC+3
     github:
-        organization: toyota-skyline
+        organization: hackaton-test-tasks
+        teachers: []
     google:
-        spreadsheet: 1fdYzNpuvU5AQInIYPUGipUXb_qUggywxRnxdcR3fuxc
+        spreadsheet: 1fdYzNpuvU5AQInIYPUGipUXb_qUggywxRnxdcR3fuxc   # ← подставь ID Google-таблицы
         info-sheet: График
         task-id-column: 0
         student-name-column: 1
         lab-column-offset: 1
-labs:
-    "1":
-        github-prefix: lab1
-        short-name: ЛР1
-    "2":
-        github-prefix: lab2
-        short-name: ЛР2
+    labs:
+        "1":
+            github-prefix: lab1
+            template-repo: hackaton-test-tasks/lab1-template
+            repo-provisioning: fork
+            short-name: ЛР1
+            ignore-task-id: True
+            ci:
+                - workflows
+            files:
+                - main.py
+        "2":
+            github-prefix: lab2
+            template-repo: hackaton-test-tasks/lab2-template
+            repo-provisioning: fork
+            short-name: ЛР2
+            ignore-task-id: True
+            ci:
+                - workflows
+            files:
+                - main.py
+        "3":
+            github-prefix: lab3
+            template-repo: hackaton-test-tasks/lab3-template
+            repo-provisioning: fork
+            short-name: ЛР3
+            ignore-task-id: True
+            ci:
+                - workflows
+            files:
+                - main.py
