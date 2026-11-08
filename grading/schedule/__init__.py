@@ -225,8 +225,13 @@ def refresh_all_groups(
     schedule_file_path: str | Path,
     groups: list[dict[str, str]],
     snapshot_path: str = "data/schedule.json",
+    course_name: str | None = None,
 ) -> dict[str, object]:
-    """Refresh numeric groups into `schedules/<course_id>.yaml`, creating it if needed."""
+    """Refresh groups, optionally filtering subjects by an exact course-name match.
+
+    Matching ignores letter case and collapses whitespace. If the course name
+    is empty or omitted, all fetched sessions are kept.
+    """
     from .guap import GuapScheduleSource
 
     from io import StringIO
@@ -286,6 +291,11 @@ def refresh_all_groups(
 
     refreshed: dict[str, int] = {}
     errors: dict[str, str] = {}
+    normalized_course_name = (
+        " ".join(course_name.casefold().split())
+        if isinstance(course_name, str) and course_name.strip()
+        else None
+    )
     for group in groups:
         group_id = group["id"]
         guap_group_id = group.get("guap_group_id") or group_id
@@ -313,6 +323,13 @@ def refresh_all_groups(
             )
             raw_lessons = source.fetch_raw(guap_group_id)
             slots = source.to_yaml_sessions(raw_lessons)
+            if normalized_course_name:
+                slots = [
+                    slot
+                    for slot in slots
+                    if " ".join(str(slot.get("subject", "")).casefold().split())
+                    == normalized_course_name
+                ]
 
             group_config["slots"] = slots
             group_config["guap_group_id"] = guap_group_id

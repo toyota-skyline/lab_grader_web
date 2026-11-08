@@ -141,6 +141,39 @@ def test_refresh_creates_initial_schedule_yaml(tmp_path, monkeypatch):
     assert data["groups"]["4432"]["slots"][0]["id"] == "new-slot"
 
 
+def test_refresh_filters_slots_by_course_name_case_insensitively(tmp_path, monkeypatch):
+    schedule_path = tmp_path / "test-course.yaml"
+
+    class FakeGuapScheduleSource:
+        def __init__(self, **_kwargs):
+            pass
+
+        def fetch_raw(self, _group_code):
+            return ["matching", "other"]
+
+        def to_yaml_sessions(self, raw_lessons):
+            return [
+                {"id": "operating-systems", "subject": "Операционные системы"},
+                {"id": "other-course", "subject": "Проектирование баз данных"},
+                {"id": "spacing-case", "subject": "  ОПЕРАЦИОННЫЕ   СИСТЕМЫ "},
+            ]
+
+    monkeypatch.setattr(guap_module, "GuapScheduleSource", FakeGuapScheduleSource)
+    result = refresh_all_groups(
+        "test-course",
+        schedule_path,
+        [{"id": "4432", "guap_group_id": "4432"}],
+        course_name=" Операционные системы ",
+    )
+
+    assert result["refreshed"] == {"4432": 2}
+    data = yaml.safe_load(schedule_path.read_text(encoding="utf-8"))
+    assert [slot["id"] for slot in data["groups"]["4432"]["slots"]] == [
+        "operating-systems",
+        "spacing-case",
+    ]
+
+
 def test_schedule_yaml_requires_course_and_group_identifiers(tmp_path):
     schedule_path = tmp_path / "test-course.yaml"
     schedule_path.write_text(

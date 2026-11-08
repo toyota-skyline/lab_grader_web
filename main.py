@@ -2685,6 +2685,7 @@ def schedule_refresh_all(
             schedule_file_path=schedule_file_path,
             groups=groups,
             snapshot_path="data/schedule.json",
+            course_name=course_info.get("name"),
         )
     except ScheduleConfigError as e:
         raise HTTPException(status_code=400, detail=f"Ошибка конфигурации расписания: {e}")

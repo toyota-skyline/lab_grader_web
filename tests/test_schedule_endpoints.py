@@ -156,6 +156,7 @@ def test_refresh_all_returns_partial_results(schedule_admin_client, monkeypatch)
         {"id": "4433", "guap_group_id": "4433"},
     ]
     assert captured["schedule_file_path"] == schedule_path
+    assert captured["course_name"] == "Test Course"
 
 
 def test_refresh_all_creates_schedule_file_on_first_request(
@@ -178,6 +179,7 @@ def test_refresh_all_creates_schedule_file_on_first_request(
                     "recurrence": {"day": "monday", "week": "all"},
                     "start": "10:00",
                     "end": "11:00",
+                    "subject": "Test Course",
                 }
             ]
 

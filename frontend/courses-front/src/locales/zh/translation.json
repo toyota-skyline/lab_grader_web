@@ -272,8 +272,25 @@
     "listTitle": "您所在小组的队列",
     "refresh": "刷新",
     "empty": "目前还没有人排队。",
+    "cannotRegister": "目前无法加入队列。",
+    "teamTitle": "您的团队",
+    "teamMembers": "成员",
+    "unnamedEntry": "学生",
+    "statuses": {
+      "ждёт": "等待中",
+      "сдал": "已通过",
+      "не_сдал": "未通过",
+      "нет": "缺席",
+      "отозван": "已退出",
+      "waiting": "等待中",
+      "passed": "已通过",
+      "failed": "未通过",
+      "absent": "缺席",
+      "withdrawn": "已退出"
+    },
     "errors": {
       "generic": "无法完成队列请求，请重试。",
+      "INVALID_RESPONSE": "服务器返回了意外的队列响应，请刷新页面。",
       "ALREADY_IN_QUEUE": "您已经在队列中。",
       "NOT_IN_QUEUE": "未找到您的队列记录。",
       "CI_NOT_PASSED": "CI 未通过，请修复代码后重试。",
@@ -284,6 +301,7 @@
       "INVALID_SHIFT": "请输入有效的后移位数。",
       "NOT_WAITING": "此队列记录无法再修改。",
       "NOT_IN_GROUP": "您只能加入自己小组的队列。",
+      "SESSION_REQUIRED": "请使用 GitHub 登录后使用队列。",
       "NO_TEAM": "您不是该实验团队的成员。",
       "TEAMS_UNAVAILABLE": "无法加载团队信息。",
       "SHEETS_UNAVAILABLE": "Google 表格暂时不可用。"
