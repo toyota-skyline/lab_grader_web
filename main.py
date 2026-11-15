@@ -16,6 +16,7 @@ import json
 import base64
 import logging
 import threading
+import time
 from datetime import datetime
 from urllib.parse import quote, urlencode
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -3036,26 +3037,143 @@ def _open_spreadsheet(course_info: dict):
         raise HTTPException(status_code=503, detail="Google Sheets недоступен")
 
 
+# --- Per-day snapshot gating + read-through cache (minimize Sheets API calls) ---
+# maybe_snapshot_past_days moves past-day queue sheets to history (a batched
+# appendCells+deleteSheet). Running it on every queue request still exhausts the
+# Sheets quota: every request re-listed worksheets, re-ensured today's sheet,
+# and wiped the read cache. Gated to run at most ONCE per (course_id, calendar
+# day): the first queue request of the day performs the snapshot under a
+# per-course lock; every later request the same day returns immediately with
+# zero Sheets API calls, so reads/status polls never re-trigger the snapshot.
+_queue_ready_done: dict = {}            # course_id -> today_str last ensured
+_queue_ready_locks: dict = {}           # course_id -> threading.Lock
+_queue_ready_locks_guard = threading.Lock()
+
+
+def _course_ready_lock(course_id: str):
+    """Return (creating if needed) a per-course Lock for snapshot serialization."""
+    with _queue_ready_locks_guard:
+        lock = _queue_ready_locks.get(course_id)
+        if lock is None:
+            lock = threading.Lock()
+            _queue_ready_locks[course_id] = lock
+        return lock
+
+
+# Shared read-through cache key: all groups/labs read the SAME daily queue sheet,
+# so one cached get_all_values serves every reader for 30s (TTL_SECONDS in
+# grading.queue.cache). Mutations invalidate the whole course cache.
+_QUEUE_SHEET_CACHE_GROUP = "__sheet__"
+_QUEUE_SHEET_CACHE_LAB = "__sheet__"
+
+
+def _read_queue_cached(spreadsheet, course_id: str, today_str: str):
+    """Read today's queue rows through the shared read-through cache.
+
+    Returns list[QueueRow]. On a cache miss the builder does one get_all_values
+    under the course lock; on a hit it returns immediately with zero Sheets
+    calls. Mutations call _invalidate_course_queue_cache to drop the entry.
+    """
+    worksheet = spreadsheet.worksheet(f"{QUEUE_SHEET_PREFIX}{today_str}")
+    return _get_queue_cache(
+        spreadsheet.id,
+        course_id,
+        _QUEUE_SHEET_CACHE_GROUP,
+        _QUEUE_SHEET_CACHE_LAB,
+        today_str,
+        lambda: read_queue_rows(worksheet),
+    )
+
+
+# Short-TTL cache for status-only lookups that are display-purpose and tolerate
+# a few seconds of staleness. Registration always rechecks these FRESH (it does
+# not use these cached helpers), so eligibility decisions stay accurate.
+_aux_cache: dict = {}                   # key -> (expires_at_monotonic, value)
+_aux_cache_guard = threading.Lock()
+_CONTEXT_CACHE_TTL = 15.0               # grade-cell context for ci_status display
+_ALREADY_PASSED_CACHE_TTL = 30.0        # history "сдал" check (passing is monotonic)
+
+
+def _load_queue_sheet_context_cached(sheets_client_fn, course_info, group_id, lab_config, username):
+    """Status-only cached wrapper around load_sheet_context (15s TTL)."""
+    key = ("ctx", course_info.get("google", {}).get("spreadsheet"), group_id, (username or "").strip().casefold())
+    now = time.monotonic()
+    with _aux_cache_guard:
+        entry = _aux_cache.get(key)
+        if entry is not None and now < entry[0]:
+            return entry[1]
+    ctx = _load_queue_sheet_context(sheets_client_fn, course_info, group_id, lab_config, username)
+    with _aux_cache_guard:
+        _aux_cache[key] = (now + _CONTEXT_CACHE_TTL, ctx)
+    return ctx
+
+
+def _check_already_passed_cached(spreadsheet, course_id, group_id, fio, lab_short_name) -> bool:
+    """Status-only cached 'already passed' check (30s TTL).
+
+    Passing a lab is monotonic and the history sheet is append-only, so a short
+    TTL is safe. Avoids ensure_history_sheet + find_in_history (a get_all_values
+    of the whole history) on every status poll.
+    """
+    if not fio:
+        return False
+    key = ("ap", spreadsheet.id, group_id, fio, lab_short_name)
+    now = time.monotonic()
+    with _aux_cache_guard:
+        entry = _aux_cache.get(key)
+        if entry is not None and now < entry[0]:
+            return entry[1]
+    result = False
+    try:
+        history_ws = ensure_history_sheet(spreadsheet)
+        if history_ws:
+            result = find_in_history(history_ws, group_id, fio, lab_short_name, STATUS_PASSED)
+    except Exception:
+        result = False
+    with _aux_cache_guard:
+        _aux_cache[key] = (now + _ALREADY_PASSED_CACHE_TTL, result)
+    return result
+
+
 def _ensure_queue_ready(spreadsheet, course_info: dict, course_id: str) -> str:
-    """Run lazy snapshot, create today's sheet, return today_str."""
+    """Run lazy snapshot + create today's sheet, ONCE per (course, day).
+
+    Returns today_str. On the first queue request of each day per course it runs
+    maybe_snapshot_past_days (batched history append), invalidates the course
+    queue cache, and ensures today's sheet exists. Every subsequent request the
+    same day returns immediately with zero Sheets API calls, so reads/status
+    polls never re-trigger the snapshot or wipe the read cache.
+    """
     today_str = _queue_today_str(course_info)
+    # Fast path: already ensured for today (no lock, no API calls).
+    if _queue_ready_done.get(course_id) == today_str:
+        return today_str
+
     from datetime import date
     today = date.fromisoformat(today_str)
 
-    # Lazy snapshot: move past-day sheets to history, delete them
-    try:
-        moved = maybe_snapshot_past_days(spreadsheet, today)
-        if moved:
-            logger.info(f"Queue snapshot moved {moved} rows to history for course {course_id}")
-    except Exception as e:
-        logger.exception(f"Queue snapshot failed for course {course_id}: {e}")
+    lock = _course_ready_lock(course_id)
+    with lock:
+        # Re-check under lock: another request may have done it while we waited.
+        if _queue_ready_done.get(course_id) == today_str:
+            return today_str
 
-    # Invalidate cache after snapshot
-    _invalidate_course_queue_cache(spreadsheet.id, course_id)
+        # Lazy snapshot: move past-day sheets to history, delete them (once/day).
+        try:
+            moved = maybe_snapshot_past_days(spreadsheet, today)
+            if moved:
+                logger.info(f"Queue snapshot moved {moved} rows to history for course {course_id}")
+        except Exception as e:
+            logger.exception(f"Queue snapshot failed for course {course_id}: {e}")
 
-    # Ensure today's sheet exists
-    group_ids = _schedule_group_ids(course_id)
-    ensure_today_sheet(spreadsheet, today, group_ids)
+        # Invalidate cache after snapshot (only when snapshot actually ran).
+        _invalidate_course_queue_cache(spreadsheet.id, course_id)
+
+        # Ensure today's sheet exists (once/day).
+        group_ids = _schedule_group_ids(course_id)
+        ensure_today_sheet(spreadsheet, today, group_ids)
+
+        _queue_ready_done[course_id] = today_str
 
     return today_str
 
@@ -3188,8 +3306,7 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
     spreadsheet = _open_spreadsheet(course_info)
     today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
 
-    worksheet = spreadsheet.worksheet(f"{QUEUE_SHEET_PREFIX}{today_str}")
-    rows = read_queue_rows(worksheet)
+    rows = _read_queue_cached(spreadsheet, course_id, today_str)
     lab_short_name = lab_config.get("short-name", lab_key)
     # One pair = one queue (issue #62 review): scope by (group, pair) of the
     # active session; the lab column is only a label of what is defended.
@@ -3282,21 +3399,18 @@ def queue_status(request: Request, course_id: str, group_id: str, lab_id: str):
         else None
     )
 
-    # Check ALREADY_PASSED
-    history_ws = None
-    try:
-        history_ws = ensure_history_sheet(spreadsheet)
-    except Exception:
-        pass
-    already_passed = False
-    if history_ws and fio:
-        already_passed = find_in_history(history_ws, group_id, fio, lab_short_name, STATUS_PASSED)
+    # Check ALREADY_PASSED (cached 30s: passing is monotonic and the history
+    # sheet is append-only — a short TTL avoids re-reading it on every poll)
+    already_passed = (
+        _check_already_passed_cached(spreadsheet, course_id, group_id, fio, lab_short_name)
+        if fio else False
+    )
 
     # Check CI status from grade cell
     ci_status = "unknown"
     try:
         if not is_team_lab(lab_config):
-            ctx = _load_queue_sheet_context(
+            ctx = _load_queue_sheet_context_cached(
                 sheets_client, course_info, group_id, lab_config, username
             )
             cell = (ctx.current_cell_value or "").strip()
@@ -3433,12 +3547,11 @@ def queue_register(request: Request, course_id: str, group_id: str, lab_id: str)
     except QueueError as e:
         raise _queue_error_to_http(e)
 
-    _invalidate_queue_cache(spreadsheet.id, course_id, group_id, lab_key, today_str)
+    _invalidate_course_queue_cache(spreadsheet.id, course_id)
 
-    worksheet = spreadsheet.worksheet(f"{QUEUE_SHEET_PREFIX}{today_str}")
     # One pair = one queue: the size is the pair queue length, not the lab's.
     scoped = [
-        r for r in read_queue_rows(worksheet)
+        r for r in _read_queue_cached(spreadsheet, course_id, today_str)
         if r.group == group_id
         and (session_no is None or r.session_no in (None, session_no))
     ]
@@ -3486,7 +3599,7 @@ def queue_withdraw(request: Request, course_id: str, group_id: str, lab_id: str)
     except QueueError as e:
         raise _queue_error_to_http(e)
 
-    _invalidate_queue_cache(spreadsheet.id, course_id, group_id, lab_key, today_str)
+    _invalidate_course_queue_cache(spreadsheet.id, course_id)
     return {"status": "withdrawn"}
 
 
@@ -3535,7 +3648,7 @@ def queue_shift(
     except QueueError as e:
         raise _queue_error_to_http(e)
 
-    _invalidate_queue_cache(spreadsheet.id, course_id, group_id, lab_key, today_str)
+    _invalidate_course_queue_cache(spreadsheet.id, course_id)
     return {"old_position": old_pos, "new_position": new_pos}
 
 
@@ -3634,8 +3747,7 @@ def queue_list(request: Request, course_id: str, group_id: str, lab_id: str):
     spreadsheet = _open_spreadsheet(course_info)
     today_str = _ensure_queue_ready(spreadsheet, course_info, course_id)
 
-    worksheet = spreadsheet.worksheet(f"{QUEUE_SHEET_PREFIX}{today_str}")
-    rows = read_queue_rows(worksheet)
+    rows = _read_queue_cached(spreadsheet, course_id, today_str)
 
     # One pair = one queue (issue #62 review): scope by (group, pair);
     # the lab column is only a label and stays in the payload.
@@ -3752,7 +3864,7 @@ def queue_set_status(
     except QueueError as e:
         return _queue_error_to_response(e)
 
-    _invalidate_queue_cache(spreadsheet.id, course_id, group_id, lab_key, today_str)
+    _invalidate_course_queue_cache(spreadsheet.id, course_id)
     return {"status": "updated", "new_status": body.status}
 
 
@@ -3793,7 +3905,7 @@ def queue_call(
     except QueueError as e:
         return _queue_error_to_response(e)
 
-    _invalidate_queue_cache(spreadsheet.id, course_id, group_id, lab_key, today_str)
+    _invalidate_course_queue_cache(spreadsheet.id, course_id)
     return {
         "called": {
             "fio": called.fio,
@@ -3836,7 +3948,7 @@ def queue_uncall(
     except QueueError as e:
         return _queue_error_to_response(e)
 
-    _invalidate_queue_cache(spreadsheet.id, course_id, group_id, lab_key, today_str)
+    _invalidate_course_queue_cache(spreadsheet.id, course_id)
     return {"status": "returned"}
 
 
